@@ -78,5 +78,12 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # tu lógica para aceptar/rechazar
+    if update.chat_join_request.chat.id != int(os.getenv("CHANNEL_ID")):
+        return
+    await update.chat_join_request.approve()
+    await context.bot.send_message(
+        chat_id=update.chat_join_request.from_user.id,
+        text="✅ Acceso aprobado, bienvenido al canal."
+    )
+
 
