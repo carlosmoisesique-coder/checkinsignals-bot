@@ -76,7 +76,6 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"🔗 Link para @{username}: {invite.invite_link}\nVálido {LINK_VALID_HOURS}h"
     )
-
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.chat_join_request.chat.id != int(os.getenv("CHANNEL_ID")):
         return
