@@ -77,4 +77,6 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔗 Link para @{username}: {invite.invite_link}\nVálido {LINK_VALID_HOURS}h"
     )
 
-async def on_join_r
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # tu lógica para aceptar/rechazar
+
