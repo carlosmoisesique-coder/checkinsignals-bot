@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os, sqlite3, time, asyncio, logging, traceback
-from datetime import datetime, timedelta
+import os, sqlite3, time, logging, traceback
+from datetime import datetime, timedelta, time as dtime
 
 import pytz
 from telegram import Update
@@ -19,7 +19,6 @@ CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()  # puede ser -100xxxxx o @c
 CHANNEL_ID = None
 if CHANNEL_ID_RAW:
     try:
-        # si viene numérico (ej: -100123...), úsalo como int; si no, quedará string (@canal)
         CHANNEL_ID = int(CHANNEL_ID_RAW)
     except ValueError:
         CHANNEL_ID = CHANNEL_ID_RAW
@@ -33,7 +32,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
-
 
 # ========= Utilidades =========
 def now_cl() -> datetime:
@@ -60,7 +58,6 @@ def db():
     return conn
 
 async def must_admin(update: Update) -> bool:
-    """Permite comandos solo a ADMIN_IDS. Si ADMIN_IDS está vacío, permite a cualquiera."""
     if not ADMIN_IDS:
         return True
     uid = update.effective_user.id if update.effective_user else 0
@@ -69,7 +66,6 @@ async def must_admin(update: Update) -> bool:
             await update.message.reply_text("No tienes permiso para este comando.")
         return False
     return True
-
 
 # ========= Comandos =========
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,7 +98,6 @@ async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     expire_unix = int((now_cl() + timedelta(hours=LINK_VALID_HOURS)).timestamp())
 
-    # crear link de invitación 1 uso con join request
     invite = await context.bot.create_chat_invite_link(
         chat_id=CHANNEL_ID,
         expire_date=expire_unix,
@@ -161,17 +156,14 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dias = int((exp - now_ts) / 86400)
         estado = "✅" if exp > now_ts else "⛔"
         out.append(f"{estado} @{(uname or '-') } (id:{uid}) vence {fmt_fecha(exp)} (≈{dias}d)")
-    txt = "\n".join(out)
-    await update.message.reply_text(txt[:4000])
+    await update.message.reply_text("\n".join(out)[:4000])
 
 async def run_checks_with_bot(bot):
-    """Banea y desbanea a vencidos para sacarlos del canal."""
     now_dt = now_cl()
     with db() as conn:
         rows = conn.execute("SELECT user_id, username, expire_ts FROM subs").fetchall()
     for uid, uname, exp in rows:
-        exp_dt = datetime.fromtimestamp(exp, TZ)
-        if now_dt > exp_dt:
+        if now_dt > datetime.fromtimestamp(exp, TZ):
             try:
                 if CHANNEL_ID:
                     await bot.ban_chat_member(chat_id=CHANNEL_ID, user_id=uid)
@@ -186,18 +178,14 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_checks_with_bot(context.bot)
     await update.message.reply_text("Chequeo completo.")
 
-
 # ========= Handler de solicitudes de unión =========
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
     if not req:
         return
 
-    # verificar que sea el canal correcto (si pasaste @, también funciona)
-    if CHANNEL_ID and req.chat.id != CHANNEL_ID:
-        # si CHANNEL_ID es string @canal, Telegram reporta id numérico igual; en ese caso no filtres
-        if isinstance(CHANNEL_ID, int):
-            return
+    if CHANNEL_ID and isinstance(CHANNEL_ID, int) and req.chat.id != CHANNEL_ID:
+        return
 
     link_url = req.invite_link.invite_link if req.invite_link else None
     plan_days = None
@@ -212,7 +200,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row:
             username_asignado, plan_days = row
 
-    # si no hay registro del link, declina (evita colados)
     if not plan_days:
         try:
             await context.bot.decline_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
@@ -220,7 +207,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         return
 
-    # registrar suscripción y aprobar
     start_ts = int(now_cl().timestamp())
     expire_ts = int((now_cl() + timedelta(days=plan_days)).timestamp())
 
@@ -237,7 +223,6 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.approve_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
 
-    # bienvenida por DM si es posible
     try:
         await context.bot.send_message(
             chat_id=req.from_user.id,
@@ -246,22 +231,12 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Forbidden:
         pass
 
-
-# ========= Tarea diaria programada (9:00 America/Santiago) =========
-def schedule_daily_checks(app):
-    async def runner():
-        while True:
-            now = now_cl()
-            target = now.replace(hour=9, minute=0, second=0, microsecond=0)
-            if now >= target:
-                target += timedelta(days=1)
-            await asyncio.sleep((target - now).total_seconds())
-            try:
-                await run_checks_with_bot(app.bot)
-            except Exception as e:
-                logging.warning("Fallo en chequeo diario: %s", e)
-    app.create_task(runner())
-
+# ========= Job diario con JobQueue (09:00 America/Santiago) =========
+async def daily_check(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await run_checks_with_bot(context.bot)
+    except Exception as e:
+        logging.warning("Fallo en chequeo diario: %s", e)
 
 # ========= Arranque =========
 def main():
@@ -281,8 +256,12 @@ def main():
     # join requests
     app.add_handler(ChatJoinRequestHandler(on_join_request))
 
-    # tarea diaria
-    schedule_daily_checks(app)
+    # job diario 09:00
+    app.job_queue.run_daily(
+        daily_check,
+        time=dtime(hour=9, minute=0, tzinfo=TZ),
+        name="daily_check"
+    )
 
     logging.info("Bot iniciando polling...")
     app.run_polling(allowed_updates=["message", "chat_join_request"])
