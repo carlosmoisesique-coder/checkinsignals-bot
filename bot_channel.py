@@ -13,9 +13,9 @@ from telegram.ext import (
     ChatJoinRequestHandler,
 )
 
-# ========= Config por variables de entorno =========
-BOT_TOKEN  = os.getenv("BOT_TOKEN", "").strip()
-CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()  # puede ser -100xxxxx o @canal
+# ========= Config =========
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID_RAW = os.getenv("CHANNEL_ID", "").strip()  # -100xxxxx o @canal
 CHANNEL_ID = None
 if CHANNEL_ID_RAW:
     try:
@@ -23,17 +23,17 @@ if CHANNEL_ID_RAW:
     except ValueError:
         CHANNEL_ID = CHANNEL_ID_RAW
 
-ADMIN_IDS  = {int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {int(x) for x in (os.getenv("ADMIN_IDS") or "").split(",") if x.strip().isdigit()}
 LINK_VALID_HOURS = int(os.getenv("LINK_VALID_HOURS", "48"))
 TZ = pytz.timezone(os.getenv("TZ", "America/Santiago"))
-DB = os.getenv("DB_PATH", "/data/suscriptores.db")
+DB = os.getenv("DB_PATH", "suscriptores.db")  # local, junto al código
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 
-# ========= Utilidades =========
+# ========= Utils & DB =========
 def now_cl() -> datetime:
     return datetime.now(TZ)
 
@@ -41,7 +41,9 @@ def fmt_fecha(ts: int) -> str:
     return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d")
 
 def db():
-    conn = sqlite3.connect(DB)
+    db_path = os.path.abspath(DB)
+    os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    conn = sqlite3.connect(db_path)
     conn.execute("""CREATE TABLE IF NOT EXISTS subs(
         user_id INTEGER PRIMARY KEY,
         username TEXT,
@@ -51,9 +53,8 @@ def db():
     )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS links(
         invite_link TEXT PRIMARY KEY,
-        username TEXT,
-        invite_expire_ts INTEGER,
-        plan_days INTEGER
+        plan_days INTEGER,
+        invite_expire_ts INTEGER
     )""")
     return conn
 
@@ -69,52 +70,69 @@ async def must_admin(update: Update) -> bool:
 
 # ========= Comandos =========
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
+    await update.message.reply_text(
         "/ping\n"
         "/help\n"
-        "/link @usuario DIAS  → genera link 1 uso (caduca en horas configuradas)\n"
-        "/renew @usuario DIAS → suma DIAS al vencimiento del usuario\n"
-        "/list                → lista suscriptores y vencimientos\n"
-        "/check               → fuerza expulsión de vencidos ahora"
+        "/link DIAS       → genera link (1 uso, se aprueba solo)\n"
+        "/renew @usuario DIAS → renueva a un usuario ya existente\n"
+        "/list            → lista suscriptores y vencimientos\n"
+        "/check           → fuerza expulsión de vencidos ahora\n"
+        "/linkraw         → link de prueba sin DB (diagnóstico)\n"
+        "/checkperms      → muestra permisos del bot en el canal"
     )
-    await update.message.reply_text(txt)
 
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 
 async def cmd_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Crea link de solicitud (join request). SOLO recibe DIAS."""
     if not await must_admin(update):
         return
     if not CHANNEL_ID:
         return await update.message.reply_text("Falta configurar CHANNEL_ID.")
-    if len(context.args) < 2:
-        return await update.message.reply_text("Uso: /link @usuario DIAS")
+    if len(context.args) < 1:
+        return await update.message.reply_text("Uso: /link DIAS   (ej: /link 30)")
 
-    username = context.args[0].lstrip("@").lower()
     try:
-        dias = int(context.args[1])
+        dias = int(context.args[0])
+        if dias <= 0:
+            raise ValueError
     except ValueError:
-        return await update.message.reply_text("DIAS debe ser número. Ej: /link @usuario 30")
+        return await update.message.reply_text("DIAS debe ser número positivo. Ej: /link 30")
 
     expire_unix = int((now_cl() + timedelta(hours=LINK_VALID_HOURS)).timestamp())
 
+    # Importante: para join request NO usar member_limit con PTB v20
     invite = await context.bot.create_chat_invite_link(
         chat_id=CHANNEL_ID,
         expire_date=expire_unix,
-        member_limit=1,
         creates_join_request=True
     )
 
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO links(invite_link, username, invite_expire_ts, plan_days) VALUES(?,?,?,?)",
-            (invite.invite_link, username, expire_unix, dias)
+            "INSERT OR REPLACE INTO links(invite_link, plan_days, invite_expire_ts) VALUES(?,?,?)",
+            (invite.invite_link, dias, expire_unix)
         )
 
     await update.message.reply_text(
-        f"🔗 Link para @{username}: {invite.invite_link}\n"
-        f"Válido {LINK_VALID_HOURS} horas, 1 uso. Plan: {dias} días."
+        f"🔗 Link: {invite.invite_link}\n"
+        f"Válido {LINK_VALID_HOURS} horas. 1 uso (se revoca al aprobar). Plan: {dias} días."
     )
+
+async def cmd_linkraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Link sin DB para probar permisos/canal."""
+    if not await must_admin(update):
+        return
+    if not CHANNEL_ID:
+        return await update.message.reply_text("Falta CHANNEL_ID.")
+    expire_unix = int((now_cl() + timedelta(hours=LINK_VALID_HOURS)).timestamp())
+    invite = await context.bot.create_chat_invite_link(
+        chat_id=CHANNEL_ID,
+        expire_date=expire_unix,
+        creates_join_request=True
+    )
+    await update.message.reply_text(f"🔗 {invite.invite_link}")
 
 async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await must_admin(update):
@@ -125,8 +143,10 @@ async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = context.args[0].lstrip("@").lower()
     try:
         dias = int(context.args[1])
+        if dias <= 0:
+            raise ValueError
     except ValueError:
-        return await update.message.reply_text("DIAS debe ser número. Ej: /renew @usuario 30")
+        return await update.message.reply_text("DIAS debe ser número positivo. Ej: /renew @usuario 30")
 
     now_ts = int(now_cl().timestamp())
     add_secs = dias * 86400
@@ -140,7 +160,7 @@ async def cmd_renew(update: Update, context: ContextTypes.DEFAULT_TYPE):
         new_exp = base_ts + add_secs
         conn.execute("UPDATE subs SET expire_ts=? WHERE user_id=?", (new_exp, uid))
 
-    await update.message.reply_text(f"🔄 Renovado @{username} hasta {fmt_fecha(new_exp)} (~{dias}d añadidos).")
+    await update.message.reply_text(f"🔄 Renovado @{username} hasta {fmt_fecha(new_exp)} (+{dias}d).")
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await must_admin(update):
@@ -149,7 +169,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = conn.execute("SELECT user_id, username, expire_ts FROM subs ORDER BY expire_ts").fetchall()
     if not rows:
         return await update.message.reply_text("Sin suscriptores.")
-
     now_ts = int(time.time())
     out = []
     for uid, uname, exp in rows:
@@ -158,6 +177,29 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         out.append(f"{estado} @{(uname or '-') } (id:{uid}) vence {fmt_fecha(exp)} (≈{dias}d)")
     await update.message.reply_text("\n".join(out)[:4000])
 
+async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await must_admin(update):
+        return
+    await run_checks_with_bot(context.bot)
+    await update.message.reply_text("Chequeo completo.")
+
+async def cmd_checkperms(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await must_admin(update):
+        return
+    try:
+        me = await context.bot.get_me()
+        cm = await context.bot.get_chat_member(CHANNEL_ID, me.id)
+        can_invite = getattr(cm, "can_invite_users", None)
+        can_manage_chat = getattr(cm, "can_manage_chat", None)
+        await update.message.reply_text(
+            f"status: {cm.status}\n"
+            f"can_invite_users: {can_invite}\n"
+            f"can_manage_chat: {can_manage_chat}\n"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ No pude leer permisos: {type(e).__name__}: {e}")
+
+# ========= Lógica de vencidos =========
 async def run_checks_with_bot(bot):
     now_dt = now_cl()
     with db() as conn:
@@ -172,13 +214,7 @@ async def run_checks_with_bot(bot):
             except Exception as e:
                 logging.warning("No pude expulsar id=%s @%s: %s", uid, uname, e)
 
-async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await must_admin(update):
-        return
-    await run_checks_with_bot(context.bot)
-    await update.message.reply_text("Chequeo completo.")
-
-# ========= Handler de solicitudes de unión =========
+# ========= Join Request =========
 async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
     if not req:
@@ -189,18 +225,18 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     link_url = req.invite_link.invite_link if req.invite_link else None
     plan_days = None
-    username_asignado = None
 
     if link_url:
         with db() as conn:
             row = conn.execute(
-                "SELECT username, plan_days FROM links WHERE invite_link=?",
+                "SELECT plan_days FROM links WHERE invite_link=?",
                 (link_url,)
             ).fetchone()
         if row:
-            username_asignado, plan_days = row
+            plan_days = int(row[0])
 
     if not plan_days:
+        # link no registrado: rechazamos para evitar colados
         try:
             await context.bot.decline_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
         except Exception:
@@ -219,9 +255,17 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start_ts=excluded.start_ts,
                 expire_ts=excluded.expire_ts,
                 last_warn=''
-        """, (req.from_user.id, username_asignado or (req.from_user.username or "").lower(), start_ts, expire_ts))
+        """, (req.from_user.id, (req.from_user.username or "").lower(), start_ts, expire_ts))
 
+    # aprobar y revocar link (lo deja de 1 uso)
     await context.bot.approve_chat_join_request(chat_id=req.chat.id, user_id=req.from_user.id)
+    try:
+        if link_url:
+            await context.bot.revoke_chat_invite_link(chat_id=req.chat.id, invite_link=link_url)
+            with db() as conn:
+                conn.execute("DELETE FROM links WHERE invite_link=?", (link_url,))
+    except Exception as e:
+        logging.warning("No pude revocar link %s: %s", link_url, e)
 
     try:
         await context.bot.send_message(
@@ -231,12 +275,22 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Forbidden:
         pass
 
-# ========= Job diario con JobQueue (09:00 America/Santiago) =========
+# ========= Job diario =========
 async def daily_check(context: ContextTypes.DEFAULT_TYPE):
     try:
         await run_checks_with_bot(context.bot)
     except Exception as e:
         logging.warning("Fallo en chequeo diario: %s", e)
+
+# ========= Keep-Alive (Replit) =========
+def maybe_keep_alive():
+    """Levanta el webserver de keep-alive si existe (Replit)."""
+    try:
+        from keep_alive import keep_alive
+        keep_alive()
+        logging.info("keep_alive activo en :8080")
+    except Exception as e:
+        logging.info("keep_alive no disponible (%s). Continuando sin él.", e)
 
 # ========= Arranque =========
 def main():
@@ -245,23 +299,28 @@ def main():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # comandos
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("link", cmd_link))
     app.add_handler(CommandHandler("renew", cmd_renew))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("check", cmd_check))
+    app.add_handler(CommandHandler("linkraw", cmd_linkraw))
+    app.add_handler(CommandHandler("checkperms", cmd_checkperms))
 
-    # join requests
     app.add_handler(ChatJoinRequestHandler(on_join_request))
 
-    # job diario 09:00
-    app.job_queue.run_daily(
-        daily_check,
-        time=dtime(hour=9, minute=0, tzinfo=TZ),
-        name="daily_check"
-    )
+    try:
+        app.job_queue.run_daily(
+            daily_check,
+            time=dtime(hour=9, minute=0, tzinfo=TZ),
+            name="daily_check"
+        )
+    except Exception as e:
+        logging.warning("JobQueue no disponible: %s", e)
+
+    # muy IMPORTANTE para UptimeRobot/Replit:
+    maybe_keep_alive()
 
     logging.info("Bot iniciando polling...")
     app.run_polling(allowed_updates=["message", "chat_join_request"])
